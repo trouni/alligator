@@ -1,7 +1,7 @@
 // Live transcript files, written by server.js when TRANSCRIPT_DIR is set.
 // Each session gets two Markdown files: what was said, in the languages it was
 // said in, and the whole conversation in one target language.
-import { open, rename, writeFile } from "node:fs/promises";
+import { access, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const LANG = /^[a-z]{2,3}$/;
@@ -21,14 +21,14 @@ export function transcriptStore(dir, targetLang = "en") {
     const base = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())} ${a}-${b}`;
     for (let n = 1; n < 100; n++) {
       const id = n === 1 ? base : `${base} (${n})`;
-      try {
-        // "wx" claims the name atomically, so two sessions in the same minute get separate files.
-        await (await open(path(`${id} original`), "wx")).close();
-      } catch (err) {
-        if (err.code === "EEXIST") continue;
-        throw err;
-      }
+      // Claimed before the await, so two sessions in the same minute get separate
+      // files; nothing is written until the session has text.
+      if (issued.has(id)) continue;
       issued.add(id);
+      if (await exists(path(`${id} original`))) {
+        issued.delete(id);
+        continue;
+      }
       return { id };
     }
     throw httpError(409, "Too many transcripts this minute.");
@@ -44,6 +44,8 @@ export function transcriptStore(dir, targetLang = "en") {
 
   return { lang: targetLang, create, write, maxBytes: MAX_BYTES };
 }
+
+const exists = (file) => access(file).then(() => true, () => false);
 
 // Write beside the file, then rename over it, so a reader (or Syncthing) never
 // sees a half-written transcript.

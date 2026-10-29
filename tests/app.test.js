@@ -614,10 +614,10 @@ test("transcript store refuses ids it did not issue and malformed bodies", async
   assert.throws(() => transcriptStore("/tmp", "english"));
 });
 
-function autosaveHarness(respond) {
+function autosaveHarness(respond, text = null) {
   const requests = [], timers = [], toasts = [];
   const context = vm.createContext({
-    transcript: { committed: 3, toMarkdown: (from, lang) => `${lang ?? "orig"} from ${from}` },
+    transcript: { committed: 3, toMarkdown: (from, lang) => text ?? `${lang ?? "orig"} from ${from}` },
     fetch: async (url, opts) => { const r = { url, ...opts, body: JSON.parse(opts.body) }; requests.push(r); return respond(r); },
     setTimeout: (fn) => { timers.push(fn); return fn; }, clearTimeout() {},
     toast: (m) => toasts.push(m), addEventListener() {},
@@ -670,4 +670,34 @@ test("autosave is off when the server keeps no transcripts, and warns once on fa
   await failing.autosave.flush(); await failing.autosave.flush();
   assert.equal(failing.toasts.length, 1);
   assert.match(failing.toasts[0], /disk full/);
+});
+
+test("transcript store writes nothing until the first save, and skips names already on disk", async () => {
+  const { mkdtemp, readdir, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { transcriptStore } = await import("../transcripts.js");
+  const dir = await mkdtemp(`${tmpdir()}/alligator-`);
+  const { id } = await transcriptStore(dir).create({ a: "ja", b: "en" });
+  assert.deepEqual(await readdir(dir), [], "Play alone leaves no file");
+  await writeFile(`${dir}/${id} original.md`, "kept\n");
+  const restarted = transcriptStore(dir);
+  assert.equal((await restarted.create({ a: "ja", b: "en" })).id, `${id} (2)`);
+});
+
+test("autosave writes nothing for a session nobody spoke in", async () => {
+  const h = autosaveHarness((r) => r.method === "POST" ? reply(200, { id: "t" }) : reply(200), "");
+  h.autosave.begin({ a: "ja", b: "en" });
+  await h.autosave.flush();
+  assert.equal(h.requests.filter((r) => r.method === "PUT").length, 0);
+});
+
+test("a flush deferred behind a write in flight keeps keepalive for a closing tab", async () => {
+  let release;
+  const h = autosaveHarness((r) => r.method === "POST" ? reply(200, { id: "t" })
+    : new Promise((ok) => (release = () => ok(reply(200)))));
+  h.autosave.begin({ a: "ja", b: "en" });
+  const first = h.autosave.flush(); await flush();
+  h.autosave.flush({ keepalive: true }); h.autosave.flush();
+  release(); await flush(); release(); await first;
+  assert.deepEqual(h.requests.filter((r) => r.method === "PUT").map((r) => r.keepalive), [false, true]);
 });

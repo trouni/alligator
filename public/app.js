@@ -776,7 +776,7 @@ class Transcript {
   // null, else every turn in `lang`, tagged where it was translated.
   toMarkdown(from, lang = null) {
     const time = (d) =>
-      d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+      d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
     return this.turns
       .slice(from, this.committed)
       .filter((t) => t.orig.trim())
@@ -1258,7 +1258,7 @@ const autosave = {
   file: null, // the latest session's { id, from, a, b, created }
   timer: null,
   inflight: null,
-  again: false,
+  again: null, // null, or the options of the flush that waits for the one in flight
 
   begin({ a, b }) {
     clearTimeout(this.timer);
@@ -1296,21 +1296,23 @@ const autosave = {
     this.timer = null;
     if (!this.file) return;
     if (this.inflight) {
-      this.again = true;
+      // The tab may be closing (pagehide): the deferred write must keep keepalive.
+      this.again = { keepalive: keepalive || Boolean(this.again?.keepalive) };
       return;
     }
     this.inflight = this.write(this.file, keepalive);
     await this.inflight;
     this.inflight = null;
-    if (this.again) {
-      this.again = false;
-      await this.flush();
-    }
+    const again = this.again;
+    this.again = null;
+    if (again) await this.flush(again);
   },
 
   async write(file, keepalive) {
     await file.created;
     if (!file.id) return;
+    const original = transcript.toMarkdown(file.from);
+    if (!original) return; // a session nobody spoke in leaves no files behind
     const lang = [file.a, file.b].includes(this.lang) ? this.lang : file.b;
     try {
       const res = await fetch(`api/transcripts/${encodeURIComponent(file.id)}`, {
@@ -1319,7 +1321,7 @@ const autosave = {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           lang,
-          original: transcript.toMarkdown(file.from) + "\n",
+          original: original + "\n",
           translation: transcript.toMarkdown(file.from, lang) + "\n",
         }),
       });
@@ -1327,7 +1329,7 @@ const autosave = {
       if (res.status === 404 && file === this.file) {
         file.id = null;
         file.created = this.create(file);
-        this.again = true;
+        this.again = { keepalive };
       } else if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || `The server returned ${res.status}.`);
