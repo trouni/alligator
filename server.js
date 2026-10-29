@@ -1,15 +1,20 @@
 // Alligator — tiny zero-dependency server.
 // Serves the static app. If SONIOX_API_KEY is set, it also mints short-lived
 // Soniox keys so that key never reaches the browser; otherwise each person
-// adds their own key in the app's Options.
+// adds their own key in the app's Options. If TRANSCRIPT_DIR is set, it also
+// keeps each session's transcript up to date in that folder while it runs.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { transcriptStore } from "./transcripts.js";
 
 const PORT = Number(process.env.PORT) || 5173;
 const API_KEY = process.env.SONIOX_API_KEY;
 const PUBLIC_DIR = join(fileURLToPath(new URL(".", import.meta.url)), "public");
+const transcripts = process.env.TRANSCRIPT_DIR
+  ? transcriptStore(process.env.TRANSCRIPT_DIR, process.env.TRANSCRIPT_LANG || "en")
+  : null;
 
 const TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -44,6 +49,22 @@ async function createTemporaryKey() {
   return body;
 }
 
+async function readJson(req, limit) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit)
+      throw Object.assign(new Error("Transcript too large."), { status: 413 });
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw Object.assign(new Error("Malformed JSON."), { status: 400 });
+  }
+}
+
 function send(res, status, body, type = "application/json") {
   res.writeHead(status, { "Content-Type": type, "Cache-Control": "no-store" });
   res.end(
@@ -59,7 +80,28 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/api/status") {
     // Lets the page know whether this server holds a key, or whether the user
     // should add their own in Options.
-    return send(res, 200, { serverKey: Boolean(API_KEY) });
+    return send(res, 200, {
+      serverKey: Boolean(API_KEY),
+      transcripts: transcripts && { lang: transcripts.lang },
+    });
+  }
+
+  if (url.pathname.startsWith("/api/transcripts")) {
+    if (!transcripts) return send(res, 404, { error: "TRANSCRIPT_DIR is not set on the server." });
+    const create = url.pathname === "/api/transcripts" && req.method === "POST";
+    const update = url.pathname.startsWith("/api/transcripts/") && req.method === "PUT";
+    if (!create && !update) return send(res, 405, { error: "Method not allowed" });
+    try {
+      const id = update && decodeURIComponent(url.pathname.slice("/api/transcripts/".length));
+      const body = (await readJson(req, transcripts.maxBytes)) || {};
+      if (create) return send(res, 200, await transcripts.create(body));
+      await transcripts.write(id, body);
+      return send(res, 200, { ok: true });
+    } catch (err) {
+      if (err instanceof URIError) err.status = 400;
+      if (!err.status) console.error(err);
+      return send(res, err.status || 500, { error: err.status ? err.message : "Couldn’t write the transcript." });
+    }
   }
 
   if (url.pathname === "/api/temporary-key") {
@@ -103,4 +145,6 @@ server.listen(PORT, () => {
     console.log(
       "No SONIOX_API_KEY on the server: each person adds their own key in Options.",
     );
+  if (transcripts)
+    console.log(`Saving transcripts to ${process.env.TRANSCRIPT_DIR} (target language: ${transcripts.lang})`);
 });

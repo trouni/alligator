@@ -722,6 +722,7 @@ class Transcript {
       pane.classList.toggle("has-content", Boolean(last));
       if (stick[i]) feeds[i].scrollTop = feeds[i].scrollHeight;
     });
+    this.onChange?.();
   }
 
   // Stacked view: what was said on top, its translation right underneath.
@@ -767,6 +768,29 @@ class Transcript {
             `${" ".repeat(head.length)}${t.transLang?.toUpperCase()}  ${t.trans.trim()}`,
           );
         return lines.join("\n");
+      })
+      .join("\n\n");
+  }
+
+  // Committed turns from index `from` as Markdown: as spoken when `lang` is
+  // null, else every turn in `lang`, tagged where it was translated.
+  toMarkdown(from, lang = null) {
+    const time = (d) =>
+      d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+    return this.turns
+      .slice(from, this.committed)
+      .filter((t) => t.orig.trim())
+      .map((t) => {
+        const src = t.lang?.toUpperCase() ?? "";
+        let text = t.orig.trim();
+        let tag = src;
+        if (lang) {
+          if (t.lang === lang) tag = "";
+          else if (t.trans.trim() && t.transLang === lang) [text, tag] = [t.trans.trim(), `from ${src}`];
+          else tag = `${src}, untranslated`;
+        }
+        const who = t.speaker == null ? "" : ` ${this.speakerName(t)}`;
+        return `**[${time(t.at)}]${who}**${tag ? ` (${tag})` : ""}\n${text}`;
       })
       .join("\n\n");
   }
@@ -910,7 +934,10 @@ const hasAnyKey = () => Boolean(store.get(KEY_PREF, "")) || serverHasKey;
 // static host this request simply fails and the user brings their own key.
 fetch("api/status")
   .then((r) => (r.ok ? r.json() : {}))
-  .then((d) => (serverHasKey = Boolean(d.serverKey)))
+  .then((d) => {
+    serverHasKey = Boolean(d.serverKey);
+    autosave.lang = d.transcripts?.lang ?? null;
+  })
   .catch(() => {})
   .finally(renderKeyOption);
 
@@ -1220,6 +1247,105 @@ function friendlyError(msg) {
   }
 }
 
+// ───────────────────────── Autosave ─────────────────────────
+// When server.js has TRANSCRIPT_DIR set, it keeps each session's transcript
+// there while the session runs: one file as spoken, one all in its language.
+
+const AUTOSAVE_MS = 3000;
+
+const autosave = {
+  lang: null, // the server's target language; null when it keeps no transcripts
+  file: null, // the latest session's { id, from, a, b, created }
+  timer: null,
+  inflight: null,
+  again: false,
+
+  begin({ a, b }) {
+    clearTimeout(this.timer);
+    this.timer = null;
+    if (!this.lang) return void (this.file = null);
+    // The transcript outlives sessions, so this file starts where this session does.
+    const file = { id: null, from: transcript.committed, a, b, warned: false };
+    file.created = this.create(file);
+    this.file = file;
+  },
+
+  async create(file) {
+    try {
+      const res = await fetch("api/transcripts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ a: file.a, b: file.b }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.id) throw new Error(data.error || `The server returned ${res.status}.`);
+      file.id = data.id;
+    } catch (err) {
+      this.warn(file, err);
+    }
+  },
+
+  // Speaker renames after the session still reach the file, until the next Play.
+  schedule() {
+    if (this.file && !this.timer) this.timer = setTimeout(() => this.flush(), AUTOSAVE_MS);
+  },
+
+  // One write at a time, so an older snapshot never lands after a newer one.
+  async flush({ keepalive = false } = {}) {
+    clearTimeout(this.timer);
+    this.timer = null;
+    if (!this.file) return;
+    if (this.inflight) {
+      this.again = true;
+      return;
+    }
+    this.inflight = this.write(this.file, keepalive);
+    await this.inflight;
+    this.inflight = null;
+    if (this.again) {
+      this.again = false;
+      await this.flush();
+    }
+  },
+
+  async write(file, keepalive) {
+    await file.created;
+    if (!file.id) return;
+    const lang = [file.a, file.b].includes(this.lang) ? this.lang : file.b;
+    try {
+      const res = await fetch(`api/transcripts/${encodeURIComponent(file.id)}`, {
+        method: "PUT",
+        keepalive,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          lang,
+          original: transcript.toMarkdown(file.from) + "\n",
+          translation: transcript.toMarkdown(file.from, lang) + "\n",
+        }),
+      });
+      // The server restarted and forgot this id: continue in a new pair of files.
+      if (res.status === 404 && file === this.file) {
+        file.id = null;
+        file.created = this.create(file);
+        this.again = true;
+      } else if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `The server returned ${res.status}.`);
+      }
+    } catch (err) {
+      this.warn(file, err);
+    }
+  },
+
+  warn(file, err) {
+    if (file.warned) return;
+    file.warned = true;
+    toast(`Couldn’t save the transcript to the server: ${err.message}`);
+  },
+};
+transcript.onChange = () => autosave.schedule();
+addEventListener("pagehide", () => autosave.flush({ keepalive: true }));
+
 // ───────────────────────── Controller ─────────────────────────
 
 let session = null;
@@ -1248,6 +1374,7 @@ function setState(state) {
   }
   if (state === "idle") {
     session = null;
+    autosave.flush();
     wakeLock?.release().catch(() => {});
     wakeLock = null;
   }
@@ -1305,6 +1432,7 @@ async function start() {
   clock.ms = 0;
   transcript.addBreak();
   transcript.closeTurn();
+  autosave.begin(prefs);
   const current = new Session(prefs);
   session = current;
   current.onState = (state) => {

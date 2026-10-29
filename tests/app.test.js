@@ -240,7 +240,7 @@ test("cancelled controller startup cannot tear down a newer session", async () =
   }
   const context = vm.createContext({
     navigator: { mediaDevices: { getUserMedia() {} } }, prefs: { source: "room" },
-    hasAnyKey: () => true, clock: {}, transcript: { addBreak() {}, closeTurn() {} }, Session,
+    hasAnyKey: () => true, clock: {}, transcript: { addBreak() {}, closeTurn() {} }, autosave: { begin() {} }, Session,
     body: { style: { setProperty() {} } }, setState: () => {}, toast() {}, KeyError: class extends Error {},
   });
   vm.runInContext("let session = null;\n" + section("async function start() {", "ui.main.addEventListener") + "globalThis.getSession = () => session;", context);
@@ -540,4 +540,134 @@ test("session lock refuses language, swap and source changes mid-session and all
   sources[1].listeners.click();
   assert.deepEqual({ ...prefs }, { a: "es", b: "ja", source: "meeting" });
   assert.equal(context.applied, 3);
+});
+
+const ja = (text, speaker = "1") => ({ text, is_final: true, language: "ja", speaker, translation_status: "original" });
+const toEn = (text, speaker = "1") => ({ text, is_final: true, language: "en", source_language: "ja", speaker, translation_status: "translation" });
+const en = (text, speaker = "2") => ({ text, is_final: true, language: "en", speaker, translation_status: "original" });
+const toJa = (text, speaker = "2") => ({ text, is_final: true, language: "ja", source_language: "en", speaker, translation_status: "translation" });
+
+function jaEnTranscript() {
+  const h = transcriptHarness();
+  Object.assign(h.prefs, { a: "ja", b: "en" });
+  h.ui.paneA.lang = "ja"; h.ui.paneB.lang = "en";
+  return h.transcript;
+}
+const stamp = String.raw`\*\*\[\d{2}:\d{2}:\d{2}\]`;
+
+test("Markdown transcript as spoken tags every turn with its language", () => {
+  const t = jaEnTranscript();
+  t.ingest([ja("おはようございます。"), toEn("Good morning."), en("Hello.", "2"), toJa("こんにちは。")]);
+  t.names.set(t.speakerKey(t.turns[1]), "Me");
+  const md = t.toMarkdown(0);
+  assert.match(md, new RegExp(`^${stamp} Speaker 1\\*\\* \\(JA\\)\\nおはようございます。\\n\\n${stamp} Me\\*\\* \\(EN\\)\\nHello\\.$`));
+});
+
+test("Markdown transcript in one language marks translated and untranslated turns", () => {
+  const t = jaEnTranscript();
+  t.ingest([ja("おはようございます。"), toEn("Good morning."), en("Hello.", "2"), toJa("こんにちは。"), ja("失礼します。", "3")]);
+  const md = t.toMarkdown(0, "en").split("\n\n");
+  assert.match(md[0], new RegExp(`^${stamp} Speaker 1\\*\\* \\(from JA\\)\\nGood morning\\.$`));
+  assert.match(md[1], new RegExp(`^${stamp} Speaker 2\\*\\*\\nHello\\.$`));
+  assert.match(md[2], new RegExp(`^${stamp} Speaker 3\\*\\* \\(JA, untranslated\\)\\n失礼します。$`));
+});
+
+test("Markdown transcript starts at the given turn and leaves out drafts", () => {
+  const t = jaEnTranscript();
+  t.ingest([ja("前の会話です。"), toEn("An earlier talk.")]);
+  const from = t.committed;
+  t.newEpoch();
+  t.ingest([ja("新しい会話です。"), toEn("A new talk."), { ...ja("まだ"), is_final: false }]);
+  const md = t.toMarkdown(from, "en");
+  assert.doesNotMatch(md, /earlier|まだ/);
+  assert.match(md, /A new talk\./);
+});
+
+test("transcript store names files by start time and pair, and writes both", async () => {
+  const { mkdtemp, readdir, readFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { transcriptStore } = await import("../transcripts.js");
+  const dir = await mkdtemp(`${tmpdir()}/alligator-`);
+  const store = transcriptStore(dir, "en");
+  const first = await store.create({ a: "ja", b: "en" });
+  const second = await store.create({ a: "ja", b: "en" });
+  assert.match(first.id, /^\d{4}-\d{2}-\d{2} \d{4} ja-en$/);
+  assert.equal(second.id, `${first.id} (2)`);
+  await store.write(first.id, { lang: "en", original: "said\n", translation: "english\n" });
+  await store.write(first.id, { lang: "en", original: "said more\n", translation: "english more\n" });
+  assert.equal(await readFile(`${dir}/${first.id} original.md`, "utf8"), "said more\n");
+  assert.equal(await readFile(`${dir}/${first.id} en.md`, "utf8"), "english more\n");
+  assert.deepEqual((await readdir(dir)).filter((f) => f.startsWith(".")), [], "no temp file left behind");
+});
+
+test("transcript store refuses ids it did not issue and malformed bodies", async () => {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { transcriptStore } = await import("../transcripts.js");
+  const store = transcriptStore(await mkdtemp(`${tmpdir()}/alligator-`), "en");
+  const body = { lang: "en", original: "", translation: "" };
+  await assert.rejects(store.write("../../etc/passwd", body), (e) => e.status === 404);
+  await assert.rejects(store.create({ a: "../x", b: "en" }), (e) => e.status === 400);
+  const { id } = await store.create({ a: "ja", b: "en" });
+  await assert.rejects(store.write(id, { ...body, lang: "../x" }), (e) => e.status === 400);
+  await assert.rejects(store.write(id, { ...body, original: 5 }), (e) => e.status === 400);
+  assert.throws(() => transcriptStore("/tmp", "english"));
+});
+
+function autosaveHarness(respond) {
+  const requests = [], timers = [], toasts = [];
+  const context = vm.createContext({
+    transcript: { committed: 3, toMarkdown: (from, lang) => `${lang ?? "orig"} from ${from}` },
+    fetch: async (url, opts) => { const r = { url, ...opts, body: JSON.parse(opts.body) }; requests.push(r); return respond(r); },
+    setTimeout: (fn) => { timers.push(fn); return fn; }, clearTimeout() {},
+    toast: (m) => toasts.push(m), addEventListener() {},
+  });
+  vm.runInContext(section("const AUTOSAVE_MS", "// ───────────────────────── Controller") + "globalThis.autosave = autosave;", context);
+  context.autosave.lang = "en";
+  return { autosave: context.autosave, requests, timers, toasts };
+}
+const reply = (status, body = {}) => ({ ok: status < 300, status, json: async () => body });
+
+test("autosave writes this session's turns in the server's language, one write at a time", async () => {
+  let release;
+  const h = autosaveHarness((r) => r.method === "POST" ? reply(200, { id: "2026-10-29 1031 ja-en" })
+    : new Promise((ok) => (release = () => ok(reply(200)))));
+  h.autosave.begin({ a: "ja", b: "en" });
+  h.autosave.schedule(); h.autosave.schedule();
+  assert.equal(h.timers.length, 1, "changes within the interval share one write");
+  const first = h.autosave.flush(); await flush();
+  const second = h.autosave.flush(); await flush();
+  assert.equal(h.requests.filter((r) => r.method === "PUT").length, 1, "second write waits for the first");
+  release(); await flush(); release(); await first; await second;
+  const puts = h.requests.filter((r) => r.method === "PUT");
+  assert.equal(puts.length, 2);
+  assert.equal(puts[0].url, "api/transcripts/2026-10-29%201031%20ja-en");
+  assert.deepEqual(puts[0].body, { lang: "en", original: "orig from 3\n", translation: "en from 3\n" });
+});
+
+test("autosave falls back to the pair's second language and recovers from a server restart", async () => {
+  let ids = 0, lost = true;
+  const h = autosaveHarness((r) => {
+    if (r.method === "POST") return reply(200, { id: `t${++ids}` });
+    if (lost) { lost = false; return reply(404, { error: "Unknown transcript." }); }
+    return reply(200);
+  });
+  h.autosave.begin({ a: "ja", b: "es" });
+  await h.autosave.flush();
+  const puts = h.requests.filter((r) => r.method === "PUT");
+  assert.deepEqual(puts.map((r) => r.url), ["api/transcripts/t1", "api/transcripts/t2"]);
+  assert.equal(puts[1].body.lang, "es");
+  assert.deepEqual(h.toasts, []);
+});
+
+test("autosave is off when the server keeps no transcripts, and warns once on failure", async () => {
+  const off = autosaveHarness(() => reply(200));
+  off.autosave.lang = null;
+  off.autosave.begin({ a: "ja", b: "en" }); off.autosave.schedule(); await off.autosave.flush();
+  assert.equal(off.requests.length, 0);
+  const failing = autosaveHarness((r) => r.method === "POST" ? reply(200, { id: "t" }) : reply(500, { error: "disk full" }));
+  failing.autosave.begin({ a: "ja", b: "en" });
+  await failing.autosave.flush(); await failing.autosave.flush();
+  assert.equal(failing.toasts.length, 1);
+  assert.match(failing.toasts[0], /disk full/);
 });

@@ -40,6 +40,15 @@ To preview the UI without a key, open `http://localhost:5173/#demo`. It replays 
 - **Each person's own key (default).** The key is saved in that browser only (`localStorage`). For each session, the browser trades it with Soniox for a 60-second, single-use key and streams with that. If the key lacks the **Temporary API keys** permission, the browser streams with the key itself. Either way, the key goes only to Soniox.
 - **One key on the server (optional).** When you run `server.js` for people who shouldn't need their own key, set `SONIOX_API_KEY` in `.env` (see `.env.example`). The server then mints the short-lived keys, and its key never reaches the browser. A key someone adds in Options takes priority over the server's.
 
+### Saving transcripts on the server (optional)
+
+Set `TRANSCRIPT_DIR` when you run `server.js`, and every session's transcript is kept up to date in that folder while it runs, a few seconds behind the screen. Each session writes two Markdown files, named by its start time and language pair:
+
+- `2026-10-29 1031 ja-en original.md`: what was said, in the language it was said in, each turn tagged `(JA)` or `(EN)`.
+- `2026-10-29 1031 ja-en en.md`: the whole conversation in `TRANSCRIPT_LANG` (default `en`; the pair's second language when the pair doesn't include it). Translated turns are tagged `(from JA)`.
+
+Only committed text is written, and speaker names you set later still reach the files until the next Play. Without `TRANSCRIPT_DIR`, nothing is stored, as above. Anyone who can reach the server can start a transcript there, so keep such a server on a private network.
+
 ## Use
 
 | Control                      | What it does                                                             |
